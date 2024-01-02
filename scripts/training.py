@@ -79,13 +79,13 @@ class Args:
     num_eval_episodes: int = 50
     # how many episodes to run at each evaluation time
 
-    best_model_save_path: str = os.path.join("path_to_some_directory", exp_name + "_best")
+    best_model_save_path: str = os.path.join("models", exp_name + "_best")
     # where to save the model with the best evaluation performance
 
-    last_model_save_path: str = os.path.join("path_to_some_directory", exp_name + "_last")
+    last_model_save_path: str = os.path.join("models", exp_name + "_last")
     # where to save the last model state
 
-    track_path: str = "path_to_save_tracks_to"
+    track_path: str = "tracks"
     # where to save the generated tracks
 
 
@@ -122,7 +122,7 @@ if __name__ == "__main__":
 
     # first we generate and save some tracks to use during evaluation (instead of generating new tracks on every reset)
     # -> leads to more stable evaluation performances that can be interpreted more reliably
-    track_path = "path_to_tracks"
+    track_path = args.track_path
     generate_tracks(num_tracks=args.num_eval_episodes, save_path=track_path)
     eval_tracks = load_tracks(track_path)
 
@@ -149,7 +149,7 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv([(make_env(seed=args.seed + i)) for i in range(1)])
     assert isinstance(envs.action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    envs_eval = create_env(args.seed, render_env=True, limit_speed_factor=None, render_width=1280)
+    envs_eval = create_env(args.seed, render_env=args.render_eval, limit_speed_factor=None, render_width=1280)
     assert isinstance(envs_eval.action_space, gym.spaces.Box), "only continuous action space is supported"
 
     actor = Agent(envs).to(device)
