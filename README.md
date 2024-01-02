@@ -7,7 +7,7 @@ To get started you can **fork this repository**. Just make sure that the forked 
 The repository contains:
 
 - The **Car Racing Environment** you are going to work on for this assignment.
-- A **environment yaml file** for the conda environment that will be used during the evaluation.
+- An **environment yaml file** for the conda environment that will be used during the evaluation.
 - **Exemplary scripts** with an example DDPG implementation to get you started into the project.
 
 The model directory contains an empty **model.obj** file.
