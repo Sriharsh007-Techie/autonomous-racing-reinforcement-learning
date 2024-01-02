@@ -79,10 +79,10 @@ class Args:
     num_eval_episodes: int = 50
     # how many episodes to run at each evaluation time
 
-    best_model_save_path: str = os.path.join("models", exp_name + "_best")
+    best_model_save_path: str = os.path.join(os.path.pardir, "models", exp_name + "_best.obj")
     # where to save the model with the best evaluation performance
 
-    last_model_save_path: str = os.path.join("models", exp_name + "_last")
+    last_model_save_path: str = os.path.join(os.path.pardir, "models", exp_name + "_last.obj")
     # where to save the last model state
 
     track_path: str = "tracks"
