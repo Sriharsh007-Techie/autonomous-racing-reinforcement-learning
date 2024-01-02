@@ -202,7 +202,8 @@ if __name__ == "__main__":
         if "final_info" in infos:
             for i, info in enumerate(infos["final_info"]):
                 print(f"global_step={global_step}, environment {i}: episodic_return={info['episode']['r'][i]}")
-                wandb.log({'train_reward': info['episode']['r'][i], 'train_ep_steps': episode_step, 'step': global_step})
+                if args.track:
+                    wandb.log({'train_reward': info['episode']['r'][i], 'train_ep_steps': episode_step, 'step': global_step})
                 episode_step = 0
 
         # save data to replay buffer; handle `final_observation`
@@ -243,9 +244,10 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-
-                wandb.log({'actor_loss': actor_loss.item(), 'step': global_step})
-            wandb.log({'qf1_loss': qf1_loss.item(), 'step': global_step})
+                if args.track:
+                    wandb.log({'actor_loss': actor_loss.item(), 'step': global_step})
+            if args.track:
+                wandb.log({'qf1_loss': qf1_loss.item(), 'step': global_step})
 
         # evaluation
         eval_episodes_performed = 0
@@ -284,8 +286,9 @@ if __name__ == "__main__":
             avg_eval_reward = total_reward / eval_episodes_performed
             avg_eval_steps = total_eval_steps / eval_episodes_performed
             print(f"Evaluation result: {avg_eval_steps} avg. steps, avg. reward: {avg_eval_reward}")
-            wandb.log({'eval_reward': avg_eval_reward, 'step': global_step})
-            wandb.log({'eval_ep_steps': avg_eval_steps, 'step': global_step})
+            if args.track:
+                wandb.log({'eval_reward': avg_eval_reward, 'step': global_step})
+                wandb.log({'eval_ep_steps': avg_eval_steps, 'step': global_step})
 
             # save model state
             if avg_eval_reward > best_eval_reward:
