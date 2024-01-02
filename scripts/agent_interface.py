@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from util import *
 from torch import nn
+import numpy as np
 
 
 def convert_obs(obs: np.ndarray):
