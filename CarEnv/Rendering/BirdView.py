@@ -11,7 +11,7 @@ from .TrackRenderer import TrackRenderer
 
 class BirdViewRenderer:
     def __init__(self, width, height, scale=15., orient_forward=False, draw_physics=False):
-        img_path = os.path.join(os.path.abspath(os.path.dirname(os.getcwd())), "CarEnv", "steering_wheel.png")
+        img_path = os.path.join(os.path.abspath(os.getcwd()), "CarEnv", "steering_wheel.png")
         self.steering_wheel_image_cairo = cairo.ImageSurface.create_from_png(img_path)
         self.steering_wheel_image_pil = Image.open(img_path)
         self._bvr = BitmapRenderer(width, height)

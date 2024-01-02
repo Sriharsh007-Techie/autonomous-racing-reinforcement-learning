@@ -4,7 +4,7 @@ import numpy as np
 
 from CarEnv.Configs import RACING_FAST
 from CarEnv.Track.Generator import make_full_environment
-from scripts.agent_interface import Agent
+from agent_interface import Agent
 
 
 def save_model(model: Agent, save_path: str):
