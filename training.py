@@ -1,22 +1,23 @@
 """
 # example
 import torch
+import numpy as np
 import os
 import random
 import time
+import gymnasium as gym
 from dataclasses import dataclass
 from gymnasium.spaces import Box
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch import nn, optim
 import torch.nn.functional as F
 
-from agent_interface import convert_action, convert_obs, Agent
-from util import *
-
+from agent_interface import convert_action, convert_obs, DDPG_Agent
+from util import save_model, create_env
 
 @dataclass
 class Args:
-    exp_name: str = "sample_solution_ddpg"
+    exp_name: str = "ddpg_benchmark_final"
     # the name of this experiment
 
     seed: int = 42
@@ -27,6 +28,9 @@ class Args:
 
     track: bool = True
     # if toggled, this experiment will be tracked with Weights and Biases
+
+    track_frequency: int = 100
+    # frequency for the tracking of actor loss and qf_loss
 
     wandb_project_name: str = "RLLBC_BPA3"
     # the wandb's project name
@@ -40,13 +44,14 @@ class Args:
     env_id: str = "Racing-Env"
     # the environment id
 
-    total_timesteps: int = 3000000
+    total_timesteps: int = 2000000
     # total timesteps of the experiments
 
     learning_rate: float = 1e-5
     # the learning rate of the optimizer
 
-    buffer_size: int = int(5e5)
+    #ToDo: Should be size of entire data
+    buffer_size: int = int(2000000)
     # the replay memory buffer size
 
     gamma: float = 0.99
@@ -70,13 +75,13 @@ class Args:
     noise_clip: float = 0.5
     # noise clip parameter of the Target Policy Smoothing Regularization
 
-    eval_freq: int = 50000
+    eval_freq: int = 10000
     # frequency of evaluation
 
     render_eval: bool = True
     # whether to render the evaluation episodes
 
-    num_eval_episodes: int = 50
+    num_eval_episodes: int = 1
     # how many episodes to run at each evaluation time
 
     best_model_save_path: str = os.path.join("models", exp_name + "_best.obj")
@@ -85,24 +90,10 @@ class Args:
     last_model_save_path: str = os.path.join("models", exp_name + "_last.obj")
     # where to save the last model state
 
-    track_path: str = "tracks"
-    # where to save the generated tracks
-
-
-def make_env(seed: int, render_env: bool = False, limit_speed_factor=None, render_width: int = 1280):
-    def thunk():
-        env = create_env(seed, render_env, limit_speed_factor, render_width)
-        return env
-    return thunk
-
-
 class QNetwork(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, obs_shape):
         super().__init__()
-
-        action_shape = envs.action_space.shape
-        obs_shape = 415  # set manually as we change the shape in convert_obs()
-
+        action_shape = env.action_space.shape
         self.fc1 = nn.Linear(obs_shape + np.prod(action_shape), 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
@@ -114,26 +105,20 @@ class QNetwork(nn.Module):
         x = self.fc3(x)
         return x
 
-
 if __name__ == "__main__":
 
     args = Args()
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.exp_name}_{args.seed}_{int(time.time())}"
 
-    # first we generate and save some tracks to use during evaluation (instead of generating new tracks on every reset)
-    # -> leads to more stable evaluation performances that can be interpreted more reliably
-    track_path = args.track_path
-    generate_tracks(num_tracks=args.num_eval_episodes, save_path=track_path)
-    eval_tracks = load_tracks(track_path)
-
-    # it can be very helpful to track the training using weights and biases
     if args.track:
         import wandb
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
+            sync_tensorboard=True,
             config=vars(args),
             name=run_name,
+            monitor_gym=True,
             save_code=True,
         )
 
@@ -143,77 +128,67 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
+    # use cuda if possible (much faster but only possible with nvidia gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([(make_env(seed=args.seed + i)) for i in range(1)])
-    assert isinstance(envs.action_space, gym.spaces.Box), "only continuous action space is supported"
-
-    envs_eval = create_env(args.seed, render_env=args.render_eval, limit_speed_factor=None, render_width=1280)
-    assert isinstance(envs_eval.action_space, gym.spaces.Box), "only continuous action space is supported"
-
-    actor = Agent(envs).to(device)
-    qf1 = QNetwork(envs).to(device)
-    qf1_target = QNetwork(envs).to(device)
-    target_actor = Agent(envs).to(device)
+    env = create_env(args.seed, render_env=False, limit_speed_factor=None, render_width=int(1280))
+    obs_shape = convert_obs(env.reset()[0]).shape[0]
+    env_eval = create_env(args.seed, render_env=args.render_eval, limit_speed_factor=None, render_width=1280)
+    assert isinstance(env_eval.action_space, Box), "only continuous action space is supported"
+    actor = DDPG_Agent(env).to(device)
+    qf1 = QNetwork(env, obs_shape).to(device)
+    qf1_target = QNetwork(env, obs_shape).to(device)
+    target_actor = DDPG_Agent(env).to(device)
     target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()), lr=args.learning_rate)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
 
-    # define Box that fits the shape of the observations obtained from convert_obs()
-    # with this we can initialize a Replay Buffer for our converted observations
-    new_shape = (envs.single_observation_space.shape[0] - 1,)
-    new_box = Box(low=envs.single_observation_space.low[:new_shape[0]], high=envs.single_observation_space.high[:new_shape[0]])
-    envs.observation_space.dtype = np.float32
+    # define Box that fits the shape of the observations obtained from convert_obs() to initialize replay buffer
+    new_shape = (obs_shape, )
+    new_box = Box(low=env.observation_space.low[:new_shape[0]], high=env.observation_space.high[:new_shape[0]])
+    env.observation_space.dtype = np.float32
     rb = ReplayBuffer(
         args.buffer_size,
         new_box,
-        envs.single_action_space,
+        env.action_space,
         device,
         handle_timeout_termination=False,
     )
 
     # start the game
-    obs, _ = envs.reset(seed=args.seed)
+    obs, _ = env.reset(seed=args.seed)
     obs = convert_obs(obs).to(device)
-
-    episode_step = 0
     best_eval_reward = -np.inf
 
     for global_step in range(args.total_timesteps):
 
-        episode_step += 1
-
         # action logic
         if global_step < args.learning_starts:
-            actions = envs.single_action_space.sample()
+            action = env.action_space.sample()
         else:
             with torch.no_grad():
-                actions = convert_action(actor(obs))
-                actions += torch.normal(0, actor.action_scale[0] * args.exploration_noise).cpu().numpy()
-                actions = actions.clip(envs.single_action_space.low, envs.single_action_space.high)
+                action = convert_action(actor(obs))
+                action += torch.normal(0, actor.action_scale[0] * args.exploration_noise).cpu().numpy()
+                action = action.clip(env.action_space.low, env.action_space.high)
 
         # execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions[np.newaxis, :])
+        next_obs, reward, termination, truncation, info = env.step(action)
         next_obs = convert_obs(next_obs).to(device)
+        stopped = False
+        if termination or truncation == True:
+            stopped = True
+        rb.add(obs.cpu(), next_obs.cpu(), action, reward, stopped, info)
 
-        # record rewards for plotting purposes and logging
-        if "final_info" in infos:
-            for i, info in enumerate(infos["final_info"]):
-                print(f"global_step={global_step}, environment {i}: episodic_return={info['episode']['r'][i]}")
-                if args.track:
-                    wandb.log({'train_reward': info['episode']['r'][i], 'train_ep_steps': episode_step, 'step': global_step})
-                episode_step = 0
+        if termination or truncation:
+            print(f"global_step={global_step}, episode_reward={info['episode']['r']}, episode_length={info['episode']['l']}")
+            if args.track:
+                wandb.log(data = {'episode_cumulative_reward': info['episode']['r'], 'episode_length': info['episode']['l']}, commit=False)
+            next_obs, _ = env.reset()
+            next_obs = convert_obs(next_obs).to(device)
 
-        # save data to replay buffer; handle `final_observation`
-        real_next_obs = next_obs.cpu().numpy().copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                real_next_obs = convert_obs(infos["final_observation"][idx])
-        rb.add(obs.cpu(), real_next_obs, actions, rewards, terminations, infos)
-
-        # CRUCIAL step easy to overlook
+        # CRUCIAL step, easy to overlook
         obs = next_obs
 
         # training logic
@@ -244,10 +219,10 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-                if args.track:
-                    wandb.log({'actor_loss': actor_loss.item(), 'step': global_step})
-            if args.track:
-                wandb.log({'qf1_loss': qf1_loss.item(), 'step': global_step})
+                if args.track and global_step % args.track_frequency == 0:
+                    wandb.log(data = {'actor_loss': actor_loss.item()}, commit = False)
+            if args.track and global_step % args.track_frequency == 0:
+                wandb.log(data = {'qf1_loss': qf1_loss.item()}, commit = False)
 
         # evaluation
         eval_episodes_performed = 0
@@ -264,18 +239,15 @@ if __name__ == "__main__":
                 truncation_eval = False
                 eval_step = 0
 
-                if i >= len(eval_tracks):
-                    print("No more tracks left!")
-                    break
-
-                obs_eval, _ = envs_eval.reset(seed=True, options={'predefined_track': eval_tracks[i]})
+                obs_eval, _ = env_eval.reset(seed=True)
                 obs_eval = convert_obs(obs_eval).to(device)
 
                 while not done and not truncation_eval:
                     eval_step += 1
                     with torch.no_grad():
                         action = convert_action(actor.get_action(obs_eval))
-                    obs_eval, reward_eval, done, truncation_eval, info_eval = envs_eval.step(action)
+                        action = action.clip(env.action_space.low, env.action_space.high)
+                    obs_eval, reward_eval, done, truncation_eval, info_eval = env_eval.step(action)
                     obs_eval = convert_obs(obs_eval).to(device)
                     total_reward += reward_eval
 
@@ -287,8 +259,7 @@ if __name__ == "__main__":
             avg_eval_steps = total_eval_steps / eval_episodes_performed
             print(f"Evaluation result: {avg_eval_steps} avg. steps, avg. reward: {avg_eval_reward}")
             if args.track:
-                wandb.log({'eval_reward': avg_eval_reward, 'step': global_step})
-                wandb.log({'eval_ep_steps': avg_eval_steps, 'step': global_step})
+                wandb.log(data = {'eval_cumulative_reward': avg_eval_reward, 'eval_episode_steps': avg_eval_steps}, step = global_step, commit = False)
 
             # save model state
             if avg_eval_reward > best_eval_reward:
@@ -297,8 +268,11 @@ if __name__ == "__main__":
                 save_model(actor, args.best_model_save_path)
             save_model(actor, args.last_model_save_path)
 
-    envs.close()
-    envs_eval.close()
+        if args.track:
+            wandb.log(data = {}, step = global_step)
+
+    env.close()
+    env_eval.close()
 """
 
 # ToDo: Your training code here...

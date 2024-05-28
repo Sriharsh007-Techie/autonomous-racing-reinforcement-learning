@@ -24,6 +24,7 @@ class TrackRenderer:
         from shapely.geometry import LinearRing
 
         if self._track_path is None:
+            
             poly = LinearRing(centerline).buffer(width / 2 + .3)  # Some extra padding
 
             _trace(ctx, poly.exterior.coords)

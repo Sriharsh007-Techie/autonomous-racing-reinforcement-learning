@@ -3,11 +3,14 @@ from enum import IntEnum
 from copy import deepcopy
 
 import gymnasium as gym
+import os
 import time
 import numpy as np
 
 from .Physics.SimpleModel import SimpleModel
 from .BatchedObjects import BatchedObjects
+from .Utils import visualize_track_state
+from .Utils import load_track
 from .Sensor import Sensor
 
 
@@ -15,7 +18,7 @@ class DiscreteSteerAction(IntEnum):
     LEFT = 0
     STRAIGHT = 1
     RIGHT = 2
-
+    
 
 def parse_generic(token: str):
     func_start = token.index('(')
@@ -88,13 +91,15 @@ class CarEnv(gym.Env):
         'render_modes': ["human", "rgb_array"]
     }
 
-    def __init__(self, render_env=False, limit_speed_factor=None, render_width=1280, config=None):
+    def __init__(self, render_env=False, limit_speed_factor=None, render_width=1280, 
+                 config=None):
         super(CarEnv, self).__init__()
 
         self.torque = 0.
         self.acc_x = 0.
         self.acc_y = 0.
         self._rng = np.random.default_rng()
+        #self._rng = self.np_random
         self._config = deepcopy(config) if config is not None else {}
         self._action = self._make_action()
         self.action_space = self._action.action_space
@@ -122,6 +127,7 @@ class CarEnv(gym.Env):
         self.steering_history_length = 20
 
         # Rendering stuff
+        #self.render_mode = render_mode
         self.render_env = render_env
         self.__renderer = None
         self.__screen = None
@@ -134,9 +140,12 @@ class CarEnv(gym.Env):
         self.steps = 0
         self.time = 0
         self.traveled_distance = 0.
-
+        
         # Histories
-        self.steering_history = None
+        self.steering_history = None       
+        
+        # Single Track
+        self.training_tracks = [load_track(str(os.path.dirname(__file__)) + "/SavedTracks/test_track/track00.obj")]
 
         # Query sensors for obs space, do this last such that everything initialized
         obs_space = {
@@ -193,12 +202,6 @@ class CarEnv(gym.Env):
             pygame.display.flip()
         else:
             raise ValueError(f"{mode = }")
-
-    def seed(self, seed=None):
-        if seed is not None:
-            self._rng = np.random.default_rng(seed=seed)
-
-        return [seed]
 
     def add_to_reward(self, val):
         self._pending_reward += val
@@ -305,11 +308,15 @@ class CarEnv(gym.Env):
         return known_types[action_dict['type']](**kwargs)
 
     def _make_sensors(self):
+        # Add sensors via class Sensor
         from .SensorConeMap import SensorConeMap
+        from .TrackSensor import TrackSensor
 
         known_types = {
             'conemap': SensorConeMap,
+            'trackpoints': TrackSensor
         }
+
 
         self.sensors = {}
 
@@ -322,6 +329,8 @@ class CarEnv(gym.Env):
         return self.sensors
 
     def reset(self, *, seed: Optional[int] = None, return_info: bool = False, options: Optional[dict] = None) -> Tuple[Any, dict]:
+        
+        
         # Clean up on reset
         if self.__renderer is not None:
             self.__renderer.close()
@@ -342,7 +351,7 @@ class CarEnv(gym.Env):
         self.metrics = {}
         self.objects = {}
 
-        predefined_track = options.get('predefined_track') if options is not None else None
+        predefined_track = self.training_tracks[0]
 
         pose = self.problem.configure_env(self, rng=self._rng, predefined_track=predefined_track)
 

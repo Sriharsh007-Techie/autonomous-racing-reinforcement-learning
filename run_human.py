@@ -6,6 +6,7 @@ from time import time, sleep
 
 
 def main():
+    
     from argparse import ArgumentParser
 
     parser = ArgumentParser()

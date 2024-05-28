@@ -1,4 +1,4 @@
-name: car-racing-evaluation
+name: car-racing-2
 channels:
   - pytorch
   - defaults
