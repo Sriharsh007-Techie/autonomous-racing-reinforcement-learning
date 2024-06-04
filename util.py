@@ -2,6 +2,7 @@ import gymnasium as gym
 import pickle
 import numpy as np
 import torch
+from copy import deepcopy
 
 from CarEnv.Configs import RACING_FAST
 from CarEnv.Track.Generator import make_full_environment
@@ -14,9 +15,11 @@ def save_model(model: Agent, save_path: str):
     :param model: the model to save
     :param save_path: where to save the actor to
     """
-    #model.to(device)  # for some models this might fail, in that case remove the line, but make sure the model is on cpu
+    model_copy = deepcopy(model)
+    if isinstance(model_copy, torch.nn.Module):
+        model_copy.to('cpu')  # for some models this might fail, in that case remove the line, but make sure the model is on cpu
     with open(save_path, 'wb') as filehandler:
-        pickle.dump(model, filehandler)
+        pickle.dump(model_copy, filehandler)
     print(f"Saving actor as {save_path}")
 
 

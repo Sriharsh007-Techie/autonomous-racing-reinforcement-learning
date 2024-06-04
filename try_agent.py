@@ -7,14 +7,13 @@ import torch
 Example evaluation script to test (and visualize) the performance of a previously saved agent on random tracks
 """
 
-load_path_model = "./models/ddpg_benchmark_best.obj"  # replace this by the actual path to your previously saved actor
+load_path_model = "./models/model.obj"  # replace this by the actual path to your previously saved actor
 num_episodes = 10
 seed = 42
 
 
 model = load_model(load_path_model)
-#env = gym.make('CarEnv:gym_envs/CarEnv-v1', config=RACING_FAST)
-env = create_env(seed = seed, render_env=True, limit_speed_factor=1, render_width=1280)
+env = create_env(seed = seed, render_env=False, limit_speed_factor=1, render_width=1280)
 
 total_reward = 0
 total_eval_steps = 0

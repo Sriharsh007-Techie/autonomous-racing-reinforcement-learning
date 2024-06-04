@@ -1,5 +1,12 @@
 """
-# example
+############################################
+######### Example Training Script ##########
+############################################
+This code is part of a sample solution that can be a good starting point for how to structure the training of an agent and do logging. However, the performance that this solution achieves is not good.
+"""
+
+# implementation based on https://docs.cleanrl.dev/rl-algorithms/ddpg/
+
 import torch
 import numpy as np
 import os
@@ -12,7 +19,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from torch import nn, optim
 import torch.nn.functional as F
 
-from agent_interface import convert_action, convert_obs, DDPG_Agent
+from agent_interface import convert_action, convert_obs, Agent
 from util import save_model, create_env
 
 @dataclass
@@ -20,7 +27,7 @@ class Args:
     exp_name: str = "ddpg_benchmark_final"
     # the name of this experiment
 
-    seed: int = 42
+    seed: int = 1
     # seed of the experiment
 
     torch_deterministic: bool = True
@@ -44,26 +51,25 @@ class Args:
     env_id: str = "Racing-Env"
     # the environment id
 
-    total_timesteps: int = 2000000
+    total_timesteps: int = 4000000
     # total timesteps of the experiments
 
-    learning_rate: float = 1e-5
+    learning_rate: float = 3e-4
     # the learning rate of the optimizer
 
-    #ToDo: Should be size of entire data
-    buffer_size: int = int(2000000)
+    buffer_size: int = int(4000000)
     # the replay memory buffer size
 
     gamma: float = 0.99
     # the discount factor gamma
 
     tau: float = 0.005
-    # target smoothing coefficient (default: 0.005)
+    # target smoothing coefficient
 
-    batch_size: int = 512
+    batch_size: int = 32
     # the batch size of sample from the reply memory
 
-    exploration_noise: float = 0.1
+    exploration_noise: float = 0.5
     # the scale of exploration noise
 
     learning_starts: int = 1e4
@@ -78,7 +84,7 @@ class Args:
     eval_freq: int = 10000
     # frequency of evaluation
 
-    render_eval: bool = True
+    render_eval: bool = False
     # whether to render the evaluation episodes
 
     num_eval_episodes: int = 1
@@ -94,9 +100,9 @@ class QNetwork(nn.Module):
     def __init__(self, env, obs_shape):
         super().__init__()
         action_shape = env.action_space.shape
-        self.fc1 = nn.Linear(obs_shape + np.prod(action_shape), 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
+        self.fc1 = nn.Linear(obs_shape + np.prod(action_shape), 64)
+        self.fc2 = nn.Linear(64, 64)
+        self.fc3 = nn.Linear(64, 1)
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
@@ -115,7 +121,7 @@ if __name__ == "__main__":
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            sync_tensorboard=False,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
@@ -127,7 +133,7 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
-
+    
     # use cuda if possible (much faster but only possible with nvidia gpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -136,10 +142,10 @@ if __name__ == "__main__":
     obs_shape = convert_obs(env.reset()[0]).shape[0]
     env_eval = create_env(args.seed, render_env=args.render_eval, limit_speed_factor=None, render_width=1280)
     assert isinstance(env_eval.action_space, Box), "only continuous action space is supported"
-    actor = DDPG_Agent(env).to(device)
+    actor = Agent(env).to(device)
     qf1 = QNetwork(env, obs_shape).to(device)
     qf1_target = QNetwork(env, obs_shape).to(device)
-    target_actor = DDPG_Agent(env).to(device)
+    target_actor = Agent(env).to(device)
     target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()), lr=args.learning_rate)
@@ -163,7 +169,7 @@ if __name__ == "__main__":
     best_eval_reward = -np.inf
 
     for global_step in range(args.total_timesteps):
-
+        
         # action logic
         if global_step < args.learning_starts:
             action = env.action_space.sample()
@@ -179,7 +185,9 @@ if __name__ == "__main__":
         stopped = False
         if termination or truncation == True:
             stopped = True
-        rb.add(obs.cpu(), next_obs.cpu(), action, reward, stopped, info)
+
+        # termination instead of stopped!
+        rb.add(obs.cpu(), next_obs.cpu(), action, reward, termination, info)
 
         if termination or truncation:
             print(f"global_step={global_step}, episode_reward={info['episode']['r']}, episode_length={info['episode']['l']}")
@@ -187,7 +195,7 @@ if __name__ == "__main__":
                 wandb.log(data = {'episode_cumulative_reward': info['episode']['r'], 'episode_length': info['episode']['l']}, commit=False)
             next_obs, _ = env.reset()
             next_obs = convert_obs(next_obs).to(device)
-
+                
         # CRUCIAL step, easy to overlook
         obs = next_obs
 
@@ -267,13 +275,9 @@ if __name__ == "__main__":
                 best_eval_reward = avg_eval_reward
                 save_model(actor, args.best_model_save_path)
             save_model(actor, args.last_model_save_path)
-
+            
         if args.track:
-            wandb.log(data = {}, step = global_step)
+            wandb.log(data = {}, step = global_step, commit=False)
 
     env.close()
     env_eval.close()
-"""
-
-# ToDo: Your training code here...
-raise NotImplementedError
