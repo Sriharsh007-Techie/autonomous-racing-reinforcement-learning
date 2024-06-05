@@ -13,7 +13,7 @@ seed = 42
 
 
 model = load_model(load_path_model)
-env = create_env(seed = seed, render_env=False, limit_speed_factor=1, render_width=1280)
+env = create_env(seed = seed, render_env=False, limit_speed_factor=None, render_width=1280)
 
 total_reward = 0
 total_eval_steps = 0
