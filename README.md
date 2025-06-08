@@ -7,13 +7,18 @@ To get started you can **fork this repository**. Just make sure that the forked 
 The repository contains:
 
 - The **Car Racing Environment** you are going to work on for this assignment.
-- An **environment.yml file** for the conda environment that will be used during the evaluation.
+- An **requirements.txt file** for the uv environment that will be used during the evaluation.
 - **Exemplary scripts** with an example DDPG implementation to get you started into the project.
 
 The model directory contains an empty **model.obj** file.
 Regard this file as a placeholder that you will have to replace with your actual model after training.
 
 For more information on the provided files and the environment, make sure to check out the provided task description.
+
+
+## Setting Up the UV Environment
+
+For this task, please create a new virtual environment by following the updated **student_guide.md**.
 
 ## Agent Description
 
