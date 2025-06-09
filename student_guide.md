@@ -25,7 +25,7 @@ macOS/Homebrew: ```brew install cairo pkg-config```
 For others and questions look into https://pycairo.readthedocs.io/en/latest/getting_started.html.
 
 ##  install the required packages with
-```uv pip sync ./requirements_student.txt```
+```uv pip sync ./requirements.txt```
 
 ## Start up JupyterLab from your terminal with
 ```jupyter-lab```
