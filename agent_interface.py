@@ -1,98 +1,119 @@
+########################################################
+#   Evaluation Interface for Racing Agent
+########################################################
 """
-###################################################
-######### Agent Interface for Evaluation ##########
-###################################################
+This file must contain ONLY:
+- convert_obs
+- convert_action
+- Agent class
 
-To hand in an agent for evaluation implement the functions "convert_obs", "convert_action" and the "Agent" class.
-For a clarification on the purpose of the different functions please read the function documentations and see the
-task description info sheet.
-
-This file will be used during the evaluation of your code. For that reason make sure that you do not use any imports that
-are not part of the evaluation environment. Also, please refrain from using this file for your training code. For that
-create and use separate scripts.
+Keep the signatures intact for compatibility with the
+evaluation system.
 """
 
-import torch
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-
-from torch import nn
 import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
 
-def convert_obs(obs: np.ndarray):
+
+# ======================================================
+# Observation converter
+# ======================================================
+def convert_obs(obs: np.ndarray) -> torch.Tensor:
     """
-    Pre-computation steps to convert the observations received from the environment into the format that can be
-    fed to your agent.
-
-    E.g. if your agent is a nn.Module and works on tensors, you would need to convert the observation to a tensor here.
-
-    :param obs: 456-dimensional numpy ndarray containing the current observations of vehicle state, sensed cones and middle line
-    :return: the converted obs that can be handled by the agent
+    Turns raw Racing-Env observations into a compact
+    feature vector for the neural net.
+    Steps:
+      1. Car state (first 16 entries).
+      2. Cones → [used, distance, sinθ, cosθ, sideL, sideR].
+      3. Centerline points → [dist, sin(dir), cos(dir), sin(tangent), cos(tangent)].
+      4. Remove indices [4..10] (pos, yaw, RGB, distance).
     """
+    raw = np.asarray(obs, dtype=np.float32).copy()
 
-    # remove unnecessary information
-    indices_to_remove = [7, 8, 9] # remove rgb_arrays
+    # car state
+    car_feats = raw[0:16].astype(np.float32)
 
-    # remove unecessary information and make tensor
-    converted_obs = np.delete(obs, indices_to_remove)
-    converted_obs = torch.tensor(converted_obs)
+    # cones
+    cone_feats = []
+    for i in range(80):
+        idx = 16 + 5 * i
+        used, x, y, sideL, sideR = raw[idx: idx + 5]
+        if used == 1.0:
+            d = np.sqrt(x ** 2 + y ** 2)
+            ang = np.arctan2(y, x)
+            s, c = np.sin(ang), np.cos(ang)
+        else:
+            d, s, c = 0.0, 0.0, 0.0
+        cone_feats.extend([used, d, s, c, sideL, sideR])
+    cone_feats = np.asarray(cone_feats, dtype=np.float32)
 
-    return converted_obs
+    # centerline
+    cl_feats = []
+    for i in range(20):
+        base = 416 + 2 * i
+        x, y = raw[base: base + 2]
+        d = np.sqrt(x ** 2 + y ** 2)
+        ang = np.arctan2(y, x)
+        s_dir, c_dir = np.sin(ang), np.cos(ang)
+        if i == 0:
+            s_t, c_t = 0.0, 0.0
+        else:
+            dy, dx = raw[base + 1] - raw[base - 1], raw[base] - raw[base - 2]
+            t = np.arctan2(dy, dx)
+            s_t, c_t = np.sin(t), np.cos(t)
+        cl_feats.extend([d, s_dir, c_dir, s_t, c_t])
+    cl_feats = np.asarray(cl_feats, dtype=np.float32)
+
+    # final vector
+    vec = np.concatenate([car_feats, cl_feats, cone_feats], axis=0)
+    cleaned = np.delete(vec, list(range(4, 11)))
+    return torch.from_numpy(cleaned).float()
 
 
-def convert_action(action):
+# ======================================================
+# Action converter
+# ======================================================
+def convert_action(action: torch.Tensor) -> np.ndarray:
     """
-    any potentially needed computation steps to convert the actions provided by your agent
-    into the format that can be fed into the environment.
-
-    E.g. if your agent is a nn.Module and returns a tensor as action, you would need to convert the action tensor
-    to a numpy array here.
-
-    :param action: the action returned by your agent
-    :return: the converted action that can be used as input to the environment's step function
+    Maps NN output to valid environment action.
+    Ensures shape (3,) and clamps values to [-1, 1].
     """
+    arr = action.detach().cpu().numpy()
+    arr = np.atleast_2d(arr)
+    arr = np.clip(arr, -1.0, 1.0)
+    return arr[0] if arr.shape[0] == 1 else arr
 
-    # not used here
-    converted_action = action.detach().cpu().numpy()
-    return converted_action
 
-
+# ======================================================
+# Agent definition
+# ======================================================
 class Agent(nn.Module):
     """
-    The Agent Class
-
-    To be able to evaluate your Code, the agent needs to implement the function "get_action". Feel free to implement
-    additional functions but make sure to not change the signature of "get_action" and the name of the class.
-
-    The querying process of your model looks schematically like that:
-    OBS -> convert_obs -> get_action -> convert_action -> ACTION
-    where OBS is the observation the environment provides and ACTION is the action that is fed into the environment.
+    Actor network:
+      fc1: obs_dim → 64
+      fc2: 64 → 128
+      output: 128 → act_dim (tanh)
     """
-
     def __init__(self, env):
         super().__init__()
+        obs_dim = int(convert_obs(env.reset()[0]).shape[0])
+        act_dim = int(np.prod(env.action_space.shape))
 
-        action_shape = env.action_space.shape
-        obs_shape = convert_obs(env.reset()[0]).shape[0]
+        self.l1 = nn.Linear(obs_dim, 64)
+        self.l2 = nn.Linear(64, 128)
+        self.mu = nn.Linear(128, act_dim)
 
-        self.fc1 = nn.Linear(obs_shape, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc_mu = nn.Linear(64, np.prod(action_shape))
-        # action rescaling
-        self.register_buffer(
-            "action_scale", torch.tensor((env.action_space.high - env.action_space.low)
-                                         / 2.0, dtype=torch.float32)
-        )
-        self.register_buffer(
-            "action_bias", torch.tensor((env.action_space.high + env.action_space.low)
-                                        / 2.0, dtype=torch.float32)
-        )
-        
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.tanh(self.fc_mu(x))
+        # rescale to match env
+        self.register_buffer("action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        x = torch.tanh(self.mu(x))
         return x * self.action_scale + self.action_bias
-        
-    def get_action(self, obs):
+
+    def get_action(self, obs: torch.Tensor) -> torch.Tensor:
         return self.forward(obs)
