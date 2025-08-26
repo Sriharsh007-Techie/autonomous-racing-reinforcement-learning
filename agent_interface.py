@@ -1,5 +1,5 @@
 ########################################################
-#   Evaluation Interface for Racing Agent
+#   Agent Interface for Racing Assignment
 ########################################################
 """
 Must expose:
@@ -20,10 +20,10 @@ import torch.nn.functional as F
 def convert_obs(obs: np.ndarray) -> torch.Tensor:
     raw = np.asarray(obs, dtype=np.float32).copy()
 
-    # car state (first 16)
+    # --- car state (first 16) ---
     car_feats = raw[0:16].astype(np.float32)
 
-    # cones: [used, dist, sin, cos, sideL, sideR] for 80 cones
+    # --- cones: 80 × [used, x, y, sideL, sideR]  -> [used, dist, sin, cos, sideL, sideR] ---
     cone_feats = []
     for i in range(80):
         idx = 16 + 5 * i
@@ -37,7 +37,7 @@ def convert_obs(obs: np.ndarray) -> torch.Tensor:
         cone_feats.extend([used, d, s, c, sideL, sideR])
     cone_feats = np.asarray(cone_feats, dtype=np.float32)
 
-    # centerline: 20 pts -> [dist, sin(dir), cos(dir), sin(tan), cos(tan)]
+    # --- centerline: 20 pts -> [dist, sin(dir), cos(dir), sin(tan), cos(tan)] ---
     cl_feats = []
     for i in range(20):
         base = 416 + 2 * i
@@ -48,13 +48,14 @@ def convert_obs(obs: np.ndarray) -> torch.Tensor:
         if i == 0:
             s_t, c_t = 0.0, 0.0
         else:
-            dy, dx = raw[base + 1] - raw[base - 1], raw[base] - raw[base - 2]
+            dy = raw[base + 1] - raw[base - 1]
+            dx = raw[base] - raw[base - 2]
             t = np.arctan2(dy, dx)
             s_t, c_t = np.sin(t), np.cos(t)
         cl_feats.extend([d, s_dir, c_dir, s_t, c_t])
     cl_feats = np.asarray(cl_feats, dtype=np.float32)
 
-    # final vector and small cleanup (drop [4..10])
+    # --- combine & drop [4..10] (global pos, yaw, RGB) to avoid leakage ---
     vec = np.concatenate([car_feats, cl_feats, cone_feats], axis=0)
     cleaned = np.delete(vec, list(range(4, 11)))
     return torch.from_numpy(cleaned).float()
@@ -64,14 +65,35 @@ def convert_obs(obs: np.ndarray) -> torch.Tensor:
 # Action converter
 # ==========================
 def convert_action(action: torch.Tensor) -> np.ndarray:
+    """
+    Input: torch tensor (usually in [-1, 1]).
+    Output: numpy array, clipped to [-1, 1], with throttle/brake exclusivity enforced.
+      action = [steer, throttle, brake], each in [-1, 1]
+      Convention: throttle>0 means accelerate; brake>0 means braking.
+    """
     arr = action.detach().cpu().numpy()
     arr = np.atleast_2d(arr)
     arr = np.clip(arr, -1.0, 1.0)
-    return arr[0] if arr.shape[0] == 1 else arr
+
+    # enforce throttle/brake exclusivity
+    if arr.shape[0] == 1:
+        a = arr[0]
+        if a[2] > 0.0:      # brake active -> kill throttle
+            a[1] = -1.0
+        elif a[1] > 0.5:    # strong throttle -> kill brake
+            a[2] = -1.0
+        return a
+    else:
+        for i in range(arr.shape[0]):
+            if arr[i, 2] > 0.0:
+                arr[i, 1] = -1.0
+            elif arr[i, 1] > 0.5:
+                arr[i, 2] = -1.0
+        return arr
 
 
 # ==========================
-# Actor (bigger MLP: 256-256)
+# Actor Network (400-300)
 # ==========================
 class Agent(nn.Module):
     def __init__(self, env):
@@ -79,11 +101,11 @@ class Agent(nn.Module):
         obs_dim = int(convert_obs(env.reset()[0]).shape[0])
         act_dim = int(np.prod(env.action_space.shape))
 
-        self.l1 = nn.Linear(obs_dim, 256)
-        self.l2 = nn.Linear(256, 256)
-        self.mu = nn.Linear(256, act_dim)
+        self.l1 = nn.Linear(obs_dim, 400)
+        self.l2 = nn.Linear(400, 300)
+        self.mu = nn.Linear(300, act_dim)
 
-        # rescale to env bounds (assumed symmetric [-1,1])
+        # rescale to env bounds (usually symmetric [-1, 1])
         self.register_buffer(
             "action_scale",
             torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32),
