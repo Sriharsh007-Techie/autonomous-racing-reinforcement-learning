@@ -1,262 +1,305 @@
 """
-============================================
-        TD3 Training Script (Improved)
-============================================
-Mods:
-- Actor LR = 1e-4
-- Batch size = 512
-- Exploration noise 0.35 -> 0.10 (decayed over 3M steps)
-- Throttle/brake exclusivity enforced in agent
-- Extra wandb logs: avg velocity, episode length, % full episodes
+############################################
+############# Training Script ##############
+############################################
+This code is part of a sample solution that can be a good starting point for how to structure
+the training of an agent and do logging. However, the performance that this solution achieves
+is not good.
+
+Implementation based on https://docs.cleanrl.dev/rl-algorithms/ddpg/
 """
 
 from __future__ import annotations
-import os, time, random, collections
+
+import os
+import time
+import random
 from dataclasses import dataclass
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn, optim
 from gymnasium.spaces import Box
 from stable_baselines3.common.buffers import ReplayBuffer
-from tqdm import tqdm
+from torch import nn, optim
 
-from agent_interface import convert_obs, convert_action, Agent
-from util import create_env, save_model
+from agent_interface import convert_action, convert_obs, Agent
+from util import save_model, create_env
 
+
+# -----------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------
+
+def print_gradients(model: nn.Module, name: str) -> float:
+    total_sq_norm = 0.0
+    num_total_elems = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_sq_norm += float(param_norm.item() ** 2)
+            num_total_elems += p.grad.numel()
+    if num_total_elems == 0:
+        return 0.0
+    return (total_sq_norm ** 0.5) / num_total_elems
+
+
+# -----------------------------------------------------------
+# Args
+# -----------------------------------------------------------
 
 @dataclass
-class Config:
-    run_name: str = "TD3_FAST_VEL~17_26AUG"
-    seed: int = 42
-    use_deterministic: bool = True
+class Args:
+    exp_name: str = "TD3_18_08_02"
+    seed: int = 41
+    torch_deterministic: bool = True
+    track: bool = True
+    track_frequency: int = 500
+    wandb_project_name: str = "RLLBC_BPA3"
+    wandb_entity: str | None = None
+    save_model: bool = True
 
-    # tracking
-    use_wandb: bool = True
-    log_interval: int = 500
-    wandb_project: str = "RLLBC_BPA3"
-    wandb_team: str | None = None
+    # env
+    env_id: str = "Racing-Env"
 
-    # training budget
-    total_steps: int = 3_000_000
-    warmup_steps: int = 50_000
-    eval_interval: int = 10_000
-    eval_episodes: int = 1
+    # training schedule
+    total_timesteps: int = 2_500_000
+    learning_starts: int = 25_000
+    eval_freq: int = 10_000
+    num_eval_episodes: int = 1
+    render_eval: bool = False
 
     # optimization
-    critic_lr: float = 3e-4
-    actor_lr: float = 1e-4
-    batch_size: int = 512
-    discount: float = 0.99
+    learning_rate: float = 6e-4
+    actor_learning_rate: float = 6e-4
+    batch_size: int = 216
+    gamma: float = 0.99
     tau: float = 0.005
 
-    # noise
-    expl_noise_init: float = 0.35
-    expl_noise_final: float = 0.10
-    target_policy_noise_init: float = 0.20
-    target_policy_noise_final: float = 0.10
-    noise_decay_steps: int = 3_000_000
-    noise_limit: float = 0.5
-    policy_update_delay: int = 2
+    # exploration / TD3 tricks
+    exploration_noise: float = 0.2
+    policy_noise: float = 0.2
+    noise_clip: float = 0.5
+    policy_frequency: int = 2
 
-    # replay buffer
-    buffer_capacity: int = 3_000_000
+    # replay
+    buffer_size: int = 2_000_000
 
     # saving
-    save_best: str = os.path.join("models", "model.obj")
-    save_latest: str = os.path.join("models", "model_latest.obj")
+    best_model_save_path: str = os.path.join("models", "TD3_18_08_02_best.obj")
+    last_model_save_path: str = os.path.join("models", "TD3_18_08_02_last.obj")
 
 
-# Critic Net
-class CriticNet(nn.Module):
-    def __init__(self, env, obs_dim: int):
+# -----------------------------------------------------------
+# Networks
+# -----------------------------------------------------------
+
+class QNetwork(nn.Module):
+    def __init__(self, env, obs_shape: int):
         super().__init__()
         act_dim = int(np.prod(env.action_space.shape))
-        self.fc1 = nn.Linear(obs_dim + act_dim, 400)
-        self.fc2 = nn.Linear(400, 300)
-        self.fc3 = nn.Linear(300, 1)
+        self.fc1 = nn.Linear(obs_shape + act_dim, 64)
+        self.fc2 = nn.Linear(64, 128)
+        self.fc3 = nn.Linear(128, 1)
 
-    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([obs, act], dim=1)
+    def forward(self, x: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([x, a], dim=1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
 
-def linear_schedule(step, start_step, end_step, start_val, end_val):
-    if step <= start_step:
-        return start_val
-    if step >= end_step:
-        return end_val
-    alpha = (step - start_step) / max(1, (end_step - start_step))
-    return (1 - alpha) * start_val + alpha * end_val
-
+# -----------------------------------------------------------
+# Main
+# -----------------------------------------------------------
 
 if __name__ == "__main__":
-    args = Config()
-    run_id = f"{args.run_name}_{args.seed}_{int(time.time())}"
+    args = Args()
+    run_name = f"{args.exp_name}_{args.seed}_{int(time.time())}"
 
-    if args.use_wandb:
+    # W&B
+    if args.track:
         import wandb
-        wandb.init(project=args.wandb_project, entity=args.wandb_team, config=vars(args), name=run_id)
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=False,
+            config=vars(args),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
 
+    # seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.use_deterministic
+    torch.backends.cudnn.deterministic = args.torch_deterministic
 
+    # device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Running on:", device)
+    print("Device:", device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        print("CUDA cache emptied.")
+        print(f"CUDA device ID: {torch.cuda.current_device()}")
+        print(f"CUDA device Name: {torch.cuda.get_device_name(torch.cuda.current_device())}")
 
-    train_env = create_env(args.seed, render_env=False, limit_speed_factor=None, render_width=1280)
-    obs_dim = int(convert_obs(train_env.reset()[0]).shape[0])
-    eval_env = create_env(args.seed, render_env=False, limit_speed_factor=None, render_width=1280)
+    # envs
+    env = create_env(args.seed, render_env=False, limit_speed_factor=None, render_width=1280)
+    obs_shape = int(convert_obs(env.reset()[0]).shape[0])
+
+    env_eval = create_env(args.seed, render_env=args.render_eval, limit_speed_factor=None, render_width=1280)
+    assert isinstance(env_eval.action_space, Box), "only continuous action space is supported"
 
     # networks
-    criticA, criticB = CriticNet(train_env, obs_dim).to(device), CriticNet(train_env, obs_dim).to(device)
-    criticA_tgt, criticB_tgt = CriticNet(train_env, obs_dim).to(device), CriticNet(train_env, obs_dim).to(device)
-    actor, actor_tgt = Agent(train_env).to(device), Agent(train_env).to(device)
+    qf1 = QNetwork(env, obs_shape).to(device)
+    qf1_target = QNetwork(env, obs_shape).to(device)
+    qf2 = QNetwork(env, obs_shape).to(device)
+    qf2_target = QNetwork(env, obs_shape).to(device)
+    actor = Agent(env).to(device)
+    target_actor = Agent(env).to(device)
 
-    actor_tgt.load_state_dict(actor.state_dict())
-    criticA_tgt.load_state_dict(criticA.state_dict())
-    criticB_tgt.load_state_dict(criticB.state_dict())
+    # target init
+    target_actor.load_state_dict(actor.state_dict())
+    qf1_target.load_state_dict(qf1.state_dict())
+    qf2_target.load_state_dict(qf2.state_dict())
 
-    critic_opt = optim.Adam(list(criticA.parameters()) + list(criticB.parameters()), lr=args.critic_lr)
-    policy_opt = optim.Adam(actor.parameters(), lr=args.actor_lr)
+    # optimizers
+    qf_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.actor_learning_rate)
 
-    buffer = ReplayBuffer(
-        args.buffer_capacity,
-        Box(low=-np.inf * np.ones(obs_dim, dtype=np.float32), high=np.inf * np.ones(obs_dim, dtype=np.float32), dtype=np.float32),
-        train_env.action_space, device, handle_timeout_termination=False
+    # replay buffer (SB3)
+    processed_obs_space = Box(
+        low=-np.inf * np.ones(obs_shape, dtype=np.float32),
+        high=np.inf * np.ones(obs_shape, dtype=np.float32),
+        dtype=np.float32,
+    )
+    env.observation_space.dtype = np.float32
+    rb = ReplayBuffer(
+        args.buffer_size,
+        processed_obs_space,
+        env.action_space,
+        device,
+        handle_timeout_termination=False,
     )
 
-    obs, _ = train_env.reset(seed=args.seed)
+    # loop state
+    global_step = 0
+    data_device_checked = False
+    obs, _ = env.reset(seed=args.seed)
     obs = convert_obs(obs).to(device)
-    reward_window = collections.deque(maxlen=50)
-    best_score = -np.inf
+    best_eval_reward = -np.inf
 
-    with tqdm(total=args.total_steps, desc="Training", ncols=140) as pbar:
-        for step in range(args.total_steps):
-            noise_std = linear_schedule(step, args.warmup_steps, args.warmup_steps + args.noise_decay_steps,
-                                        args.expl_noise_init, args.expl_noise_final)
+    for global_step in range(args.total_timesteps):
+        # Action selection
+        if global_step < args.learning_starts:
+            action = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                raw_action = actor.get_action(obs)
+                noise = torch.randn_like(raw_action) * args.exploration_noise
+                raw_action = (raw_action + noise).clamp(-1, 1)
+                action = convert_action(raw_action)
+                action = np.clip(action, env.action_space.low, env.action_space.high)
 
-            if step < args.warmup_steps:
-                action = train_env.action_space.sample()
-            else:
-                with torch.no_grad():
-                    act_raw = actor.get_action(obs)
-                    noise = torch.randn_like(act_raw) * noise_std
-                    act_raw = (act_raw + noise).clamp(-1, 1)
-                    action = convert_action(act_raw)
+        # Step env
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        next_obs = convert_obs(next_obs).to(device)
+        done = terminated or truncated
 
-            nxt_obs, reward, term, trunc, info = train_env.step(action)
-            nxt_obs = convert_obs(nxt_obs).to(device)
-            done = term or trunc
-            buffer.add(obs.cpu(), nxt_obs.cpu(), action, float(reward), done, info)
-            obs = nxt_obs if not done else convert_obs(train_env.reset()[0]).to(device)
+        rb.add(obs.cpu(), next_obs.cpu(), action, reward, done, info)
 
-            # =========================
-            # Episode finished
-            # =========================
-            if done and "episode" in info:
-                ep_r = float(info["episode"]["r"])
-                ep_len = float(info["episode"]["l"])
-                reward_window.append(ep_r)
-                avg_recent = np.mean(reward_window)
+        if done:
+            print(f"step={global_step}, episode_reward={info['episode']['r']}, length={info['episode']['l']}")
+            if args.track:
+                wandb.log({"episode_cumulative_reward": info["episode"]["r"], "episode_length": info["episode"]["l"]}, commit=False)
+            next_obs, _ = env.reset()
+            next_obs = convert_obs(next_obs).to(device)
 
-                # --- NEW METRICS ---
-                avg_velocity = (ep_r / ep_len) / 0.01 if ep_len > 0 else 0.0
-                hit_full = 1.0 if ep_len >= 600 else 0.0
+        obs = next_obs
 
-                pbar.set_postfix({
-                    "R": f"{ep_r:.1f}",
-                    "avg50": f"{avg_recent:.1f}",
-                    "noise": f"{noise_std:.2f}",
-                    "vel": f"{avg_velocity:.1f}"
-                })
+        # Learn
+        if global_step > args.learning_starts:
+            data = rb.sample(args.batch_size)
 
-                if args.use_wandb:
-                    wandb.log({
-                        "ep_return": ep_r,
-                        "avg50_return": avg_recent,
-                        "expl_noise": float(noise_std),
-                        "ep_len": ep_len,
-                        "avg_velocity": avg_velocity,
-                        "full_episode": hit_full
-                    }, commit=False)
+            if not data_device_checked:
+                print(f"Observations device: {data.observations.device}")
+                print(f"Actions device: {data.actions.device}")
+                data_device_checked = True
 
-            # =========================
-            # Learning step
-            # =========================
-            if step > args.warmup_steps:
-                batch = buffer.sample(args.batch_size)
+            with torch.no_grad():
+                raw_next_action = target_actor.get_action(data.next_observations)
+                noise = (torch.randn_like(raw_next_action) * args.policy_noise).clamp(-args.noise_clip, args.noise_clip)
+                next_actions = (raw_next_action + noise).clamp(-1, 1)
+                next_actions = next_actions * actor.action_scale + actor.action_bias
 
-                with torch.no_grad():
-                    nxt_act = actor_tgt.get_action(batch.next_observations)
-                    t_noise = (torch.randn_like(nxt_act) * 0.1).clamp(-args.noise_limit, args.noise_limit)
-                    nxt_act = (nxt_act + t_noise).clamp(-1, 1)
+                q1_target = qf1_target(data.next_observations, next_actions)
+                q2_target = qf2_target(data.next_observations, next_actions)
+                min_q_target = torch.min(q1_target, q2_target)
+                target_q = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * min_q_target.view(-1)
 
-                    q1_tgt = criticA_tgt(batch.next_observations, nxt_act)
-                    q2_tgt = criticB_tgt(batch.next_observations, nxt_act)
-                    y = batch.rewards.flatten() + (1 - batch.dones.flatten()) * args.discount * torch.min(q1_tgt, q2_tgt).view(-1)
+            q1_loss = F.mse_loss(qf1(data.observations, data.actions).view(-1), target_q)
+            q2_loss = F.mse_loss(qf2(data.observations, data.actions).view(-1), target_q)
+            qf_loss = q1_loss + q2_loss
 
-                q1_loss = F.mse_loss(criticA(batch.observations, batch.actions).view(-1), y)
-                q2_loss = F.mse_loss(criticB(batch.observations, batch.actions).view(-1), y)
-                critic_loss = q1_loss + q2_loss
-                critic_opt.zero_grad(); critic_loss.backward(); critic_opt.step()
+            qf_optimizer.zero_grad()
+            qf_loss.backward()
+            qf_optimizer.step()
 
-                if step % args.policy_update_delay == 0:
-                    policy_loss = -criticA(batch.observations, actor.get_action(batch.observations)).mean()
-                    policy_opt.zero_grad(); policy_loss.backward(); policy_opt.step()
+            if global_step % args.policy_frequency == 0:
+                actor_loss = -qf1(data.observations, actor.get_action(data.observations)).mean()
+                actor_optimizer.zero_grad()
+                actor_loss.backward()
+                actor_optimizer.step()
 
-                    for net, net_tgt in [(actor, actor_tgt), (criticA, criticA_tgt), (criticB, criticB_tgt)]:
-                        for p, tp in zip(net.parameters(), net_tgt.parameters()):
-                            tp.data.copy_(args.tau * p.data + (1 - args.tau) * tp.data)
+                # soft update
+                for p, tp in zip(actor.parameters(), target_actor.parameters()):
+                    tp.data.copy_(args.tau * p.data + (1 - args.tau) * tp.data)
+                for p, tp in zip(qf1.parameters(), qf1_target.parameters()):
+                    tp.data.copy_(args.tau * p.data + (1 - args.tau) * tp.data)
+                for p, tp in zip(qf2.parameters(), qf2_target.parameters()):
+                    tp.data.copy_(args.tau * p.data + (1 - args.tau) * tp.data)
 
-                    if args.use_wandb and step % args.log_interval == 0:
-                        wandb.log({"actor_loss": policy_loss.item()}, commit=False)
-                if args.use_wandb and step % args.log_interval == 0:
-                    wandb.log({"critic_loss": critic_loss.item()}, commit=True)
+                if args.track and global_step % args.track_frequency == 0:
+                    wandb.log({"actor_loss": actor_loss.item(), "actor_grad": print_gradients(actor, "Actor")}, commit=False)
+            if args.track and global_step % args.track_frequency == 0:
+                wandb.log({"qf_loss": qf_loss.item()}, commit=True)
 
-            # =========================
-            # Evaluation
-            # =========================
-            if step > args.warmup_steps and step % args.eval_interval == 0:
-                total_r, total_len = 0, 0
-                for _ in range(args.eval_episodes):
-                    ob_eval, _ = eval_env.reset(seed=True)
-                    ob_eval = convert_obs(ob_eval).to(device)
-                    d = False
-                    steps_eval = 0
-                    ep_eval_r = 0.0
-                    while not d:
-                        with torch.no_grad():
-                            act_eval = convert_action(actor.get_action(ob_eval))
-                        ob_eval, r, term, trunc, _ = eval_env.step(act_eval)
-                        ob_eval = convert_obs(ob_eval).to(device)
-                        d = term or trunc
-                        ep_eval_r += float(r)
-                        steps_eval += 1
-                    total_r += ep_eval_r
-                    total_len += steps_eval
+        # Evaluation
+        if global_step > args.learning_starts and global_step % args.eval_freq == 0:
+            total_reward, total_steps = 0, 0
+            for i in range(args.num_eval_episodes):
+                obs_eval, _ = env_eval.reset(seed=True)
+                obs_eval = convert_obs(obs_eval).to(device)
+                done, steps = False, 0
+                while not done:
+                    with torch.no_grad():
+                        action_eval = convert_action(actor.get_action(obs_eval))
+                        action_eval = np.clip(action_eval, env.action_space.low, env.action_space.high)
+                    obs_eval, reward_eval, terminated, truncated, info_eval = env_eval.step(action_eval)
+                    obs_eval = convert_obs(obs_eval).to(device)
+                    done = terminated or truncated
+                    total_reward += reward_eval
+                    steps += 1
+                total_steps += steps
 
-                avg_r = total_r / args.eval_episodes
-                avg_steps = total_len / args.eval_episodes
-                avg_velocity_eval = (avg_r / avg_steps) / 0.01 if avg_steps > 0 else 0.0
+            avg_reward = total_reward / args.num_eval_episodes
+            avg_steps = total_steps / args.num_eval_episodes
+            print(f"Eval: {avg_steps} avg steps, {avg_reward} avg reward")
 
-                print(f"[Eval] reward={avg_r:.2f}, steps={avg_steps:.1f}, vel={avg_velocity_eval:.1f}")
-                if args.use_wandb:
-                    wandb.log({
-                        "eval_reward": avg_r,
-                        "eval_steps": avg_steps,
-                        "eval_avg_velocity": avg_velocity_eval
-                    }, step=step, commit=False)
+            if args.track:
+                wandb.log({"eval_cumulative_reward": avg_reward, "eval_episode_steps": avg_steps}, step=global_step, commit=False)
 
-                if avg_r > best_score:
-                    best_score = avg_r; save_model(actor, args.save_best)
-                save_model(actor, args.save_latest)
+            if avg_reward > best_eval_reward:
+                print("NEW BEST EVAL PERFORMANCE:", avg_reward)
+                best_eval_reward = avg_reward
+                save_model(actor, args.best_model_save_path)
+            save_model(actor, args.last_model_save_path)
 
-            pbar.update(1)
+        if args.track:
+            wandb.log({}, step=global_step, commit=False)
 
-    train_env.close(); eval_env.close()
+    env.close()
+    env_eval.close()

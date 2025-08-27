@@ -1,111 +1,110 @@
-########################################################
-#   Agent Interface for Racing Assignment
-########################################################
+###################################################
+######### Agent Interface for Evaluation ##########
+###################################################
+
 """
-Must expose:
-- convert_obs(np.ndarray) -> torch.Tensor
-- convert_action(torch.Tensor) -> np.ndarray
-- Agent(env) : nn.Module with get_action(obs)
+This file will be used during the evaluation of your code.
+Define ONLY: convert_obs, convert_action, and Agent.
 """
 
-import numpy as np
 import torch
+import numpy as np
 from torch import nn
 import torch.nn.functional as F
 
 
-# ==========================
-# Observation converter
-# ==========================
 def convert_obs(obs: np.ndarray) -> torch.Tensor:
-    raw = np.asarray(obs, dtype=np.float32).copy()
+    """
+    Convert raw env observation into NN-friendly format.
 
-    # --- car state (first 16) ---
-    car_feats = raw[0:16].astype(np.float32)
+    - Car state: first 16 values (unchanged)
+    - Cones: [used, dist, sin(theta), cos(theta), sideL, sideR] → 6 values per cone
+    - Centerline: [dist, sin(dir_angle), cos(dir_angle), sin(tangent), cos(tangent)] → 5 values per point
+    - After concatenation, drop indices [4..10] (position, RGB, distance)
+    """
+    src = np.asarray(obs, dtype=np.float32).copy()
 
-    # --- cones: 80 × [used, x, y, sideL, sideR]  -> [used, dist, sin, cos, sideL, sideR] ---
-    cone_feats = []
+    # --- car state ---
+    car_state = src[0:16].astype(np.float32)
+
+    # --- cones (80 cones × 5 raw values) ---
+    cones_out = []
     for i in range(80):
-        idx = 16 + 5 * i
-        used, x, y, sideL, sideR = raw[idx: idx + 5]
+        base = 16 + i * 5
+        used = float(src[base])
+        x, y = float(src[base + 1]), float(src[base + 2])
+        sideL, sideR = float(src[base + 3]), float(src[base + 4])
+
         if used == 1.0:
-            d = np.sqrt(x ** 2 + y ** 2)
+            dist = np.sqrt(x * x + y * y)
             ang = np.arctan2(y, x)
             s, c = np.sin(ang), np.cos(ang)
         else:
-            d, s, c = 0.0, 0.0, 0.0
-        cone_feats.extend([used, d, s, c, sideL, sideR])
-    cone_feats = np.asarray(cone_feats, dtype=np.float32)
+            dist, s, c = 0.0, 0.0, 0.0
 
-    # --- centerline: 20 pts -> [dist, sin(dir), cos(dir), sin(tan), cos(tan)] ---
-    cl_feats = []
+        cones_out.extend([used, dist, s, c, sideL, sideR])
+    cones_out = np.asarray(cones_out, dtype=np.float32)
+
+    # --- centerline (20 points × 2 raw values) ---
+    center_out = []
     for i in range(20):
-        base = 416 + 2 * i
-        x, y = raw[base: base + 2]
-        d = np.sqrt(x ** 2 + y ** 2)
-        ang = np.arctan2(y, x)
-        s_dir, c_dir = np.sin(ang), np.cos(ang)
+        base = 416 + i * 2
+        x, y = float(src[base]), float(src[base + 1])
+
+        dist = np.sqrt(x * x + y * y)
+        a = np.arctan2(y, x)
+        s_dir, c_dir = np.sin(a), np.cos(a)
+
         if i == 0:
-            s_t, c_t = 0.0, 0.0
+            s_tan, c_tan = 0.0, 0.0
         else:
-            dy = raw[base + 1] - raw[base - 1]
-            dx = raw[base] - raw[base - 2]
+            dy, dx = src[base + 1] - src[base - 1], src[base] - src[base - 2]
             t = np.arctan2(dy, dx)
-            s_t, c_t = np.sin(t), np.cos(t)
-        cl_feats.extend([d, s_dir, c_dir, s_t, c_t])
-    cl_feats = np.asarray(cl_feats, dtype=np.float32)
+            s_tan, c_tan = np.sin(t), np.cos(t)
 
-    # --- combine & drop [4..10] (global pos, yaw, RGB) to avoid leakage ---
-    vec = np.concatenate([car_feats, cl_feats, cone_feats], axis=0)
-    cleaned = np.delete(vec, list(range(4, 11)))
-    return torch.from_numpy(cleaned).float()
+        center_out.extend([dist, s_dir, c_dir, s_tan, c_tan])
+    center_out = np.asarray(center_out, dtype=np.float32)
+
+    # --- final feature vector ---
+    final = np.concatenate([car_state, center_out, cones_out], axis=0)
+
+    # drop indices [4..10] (position x,y, yaw angle, RGB, distance)
+    converted = np.delete(final, list(range(4, 11)))
+
+    return torch.from_numpy(converted).float()
 
 
-# ==========================
-# Action converter
-# ==========================
 def convert_action(action: torch.Tensor) -> np.ndarray:
     """
-    Input: torch tensor (usually in [-1, 1]).
-    Output: numpy array, clipped to [-1, 1], with throttle/brake exclusivity enforced.
-      action = [steer, throttle, brake], each in [-1, 1]
-      Convention: throttle>0 means accelerate; brake>0 means braking.
+    Convert NN action → environment action.
+    Ensures shape (3,) and clips to [-1, 1].
     """
     arr = action.detach().cpu().numpy()
     arr = np.atleast_2d(arr)
     arr = np.clip(arr, -1.0, 1.0)
-
-    # enforce throttle/brake exclusivity
     if arr.shape[0] == 1:
-        a = arr[0]
-        if a[2] > 0.0:      # brake active -> kill throttle
-            a[1] = -1.0
-        elif a[1] > 0.5:    # strong throttle -> kill brake
-            a[2] = -1.0
-        return a
-    else:
-        for i in range(arr.shape[0]):
-            if arr[i, 2] > 0.0:
-                arr[i, 1] = -1.0
-            elif arr[i, 1] > 0.5:
-                arr[i, 2] = -1.0
-        return arr
+        return arr[0]
+    return arr
 
 
-# ==========================
-# Actor Network (400-300)
-# ==========================
 class Agent(nn.Module):
+    """
+    Minimal MLP actor:
+      - fc1: obs_dim -> 64, ReLU
+      - fc2: 64 -> 128, ReLU
+      - fc_mu: 128 -> act_dim, tanh
+    """
+
     def __init__(self, env):
         super().__init__()
+        action_shape = env.action_space.shape
         obs_dim = int(convert_obs(env.reset()[0]).shape[0])
-        act_dim = int(np.prod(env.action_space.shape))
+        act_dim = int(np.prod(action_shape))
 
-        self.l1 = nn.Linear(obs_dim, 400)
-        self.l2 = nn.Linear(400, 300)
-        self.mu = nn.Linear(300, act_dim)
+        self.fc1 = nn.Linear(obs_dim, 64)
+        self.fc2 = nn.Linear(64, 128)
+        self.fc_mu = nn.Linear(128, act_dim)
 
-        # rescale to env bounds (usually symmetric [-1, 1])
         self.register_buffer(
             "action_scale",
             torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32),
@@ -116,9 +115,9 @@ class Agent(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        x = torch.tanh(self.mu(x))
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = torch.tanh(self.fc_mu(x))
         return x * self.action_scale + self.action_bias
 
     def get_action(self, obs: torch.Tensor) -> torch.Tensor:
