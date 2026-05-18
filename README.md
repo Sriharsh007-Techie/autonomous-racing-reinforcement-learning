@@ -1,13 +1,3 @@
-
-# BPA III – Car Racing Challenge
-
-**Group:** 27 **Team:** Gryffindor  
-**Member:** Sriharsh Kulkarni, Sahil Mane & Atharva Bhorpe
-
-This repository contains our final submission for the **RLLBC Bonus Point Assignment III**.
-
----
-
 ## 1) What we train: Algorithm overview
 
 We use **Twin Delayed Deep Deterministic Policy Gradient (TD3)** for continuous control in the racing environment:
@@ -89,14 +79,25 @@ The `convert_action` function ensures:
 
 ---
 
-## 7) Results (evaluation)
+## 7) # Training Performance
 
-With the current setup:
-- **Average episodic return:** ~80–85 during late training  
-- **Consistent policy behavior:** smooth driving and steady velocity without excessive penalties  
+## Episode Return
 
-Further tuning (exploration decay and larger networks) is expected to push rewards even higher.
+<p align="center">
+  <img src="images/ep_return.png" width="800">
+</p>
 
+## Average Reward
+
+<p align="center">
+  <img src="images/avg50.png" width="800">
+</p>
+
+## Critic Loss
+
+<p align="center">
+  <img src="images/critic_loss.png" width="800">
+</p>
 ---
 
 ## 8) File map
